@@ -79,6 +79,7 @@ static struct timeval start_time;
 static int ticks_per_sec;
 static int total_ms, wall_ms;
 static volatile sig_atomic_t timer_tick;
+static volatile sig_atomic_t sigint_plemplem;
 
 static int error_pipes[2];
 static int write_errors_to_fd;
@@ -991,8 +992,9 @@ static void
 signal_int(int unused UNUSED)
 {
   /* Interrupts are fatal, so no synchronization requirements. */
-  meta_printf("exitsig:%d\n", SIGINT);
-  err("SG: Interrupted");
+  //meta_printf("exitsig:%d\n", SIGINT);
+  //err("SG: Interrupted");
+  sigint_plemplem = 1;
 }
 
 #define PROC_BUF_SIZE 4096
@@ -1114,6 +1116,11 @@ box_keeper(void)
 	  check_timeout();
 	  timer_tick = 0;
 	}
+      if (sigint_plemplem)
+	{
+	  box_exit(0);
+	}
+
       p = wait4(box_pid, &stat, 0, &rus);
       if (p < 0)
 	{
