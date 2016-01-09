@@ -1,13 +1,13 @@
 /*
  *	A Process Isolator based on Linux Containers
  *
- *	(c) 2012-2013 Martin Mares <mj@ucw.cz>
- *	(c) 2012-2013 Bernard Blackham <bernard@blackham.com.au>
+ *	(c) 2012-2015 Martin Mares <mj@ucw.cz>
+ *	(c) 2012-2014 Bernard Blackham <bernard@blackham.com.au>
  */
 
 #define _GNU_SOURCE
 
-#include "autoconf.h"
+#include "config.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -32,12 +32,15 @@
 #include <sys/stat.h>
 #include <sys/quota.h>
 #include <sys/vfs.h>
+#include <sys/fsuid.h>
 
 /* May not be defined in older glibc headers */
 #ifndef MS_PRIVATE
+#warning "Working around old glibc: no MS_PRIVATE"
 #define MS_PRIVATE (1 << 18)
 #endif
 #ifndef MS_REC
+#warning "Working around old glibc: no MS_REC"
 #define MS_REC     (1 << 14)
 #endif
 
@@ -58,6 +61,7 @@ static int inode_quota;
 static int max_processes = 1;
 static char *redir_stdin, *redir_stdout, *redir_stderr;
 static char *set_cwd;
+static int share_net;
 
 static int cg_enable;
 static int cg_memory_limit;
@@ -104,13 +108,11 @@ meta_open(const char *name)
       metafile = stdout;
       return;
     }
-  if (setreuid(geteuid(), getuid()) == -1)
-    die("Failed to setreuid: %m");
-
+  if (setfsuid(getuid()) < 0)
+    die("Failed to switch FS UID: %m");
   metafile = fopen(name, "w");
-  if (setreuid(geteuid(), getuid()) == -1)
-    die("Failed to setreuid: %m");
-
+  if (setfsuid(geteuid()) < 0)
+    die("Failed to switch FS UID back: %m");
   if (!metafile)
     die("Failed to open metafile '%s'",name);
 }
@@ -172,9 +174,7 @@ box_exit(int rc)
     }
 
   if (rc < 2 && cleanup_ownership)
-    {
-      chowntree("box", orig_uid, orig_gid);
-    }
+    chowntree("box", orig_uid, orig_gid);
 
   meta_close();
   exit(rc);
@@ -277,7 +277,7 @@ static int dir_exists(char *path)
 }
 
 static int rmtree_helper(const char *fpath, const struct stat *sb,
-    int typeflag, struct FTW *ftwbuf)
+    int typeflag UNUSED, struct FTW *ftwbuf UNUSED)
 {
   if (S_ISDIR(sb->st_mode))
     {
@@ -300,8 +300,9 @@ rmtree(char *path)
 
 static uid_t chown_uid;
 static gid_t chown_gid;
-static int chowntree_helper(const char *fpath, const struct stat *sb,
-    int typeflag, struct FTW *ftwbuf)
+
+static int chowntree_helper(const char *fpath, const struct stat *sb UNUSED,
+    int typeflag UNUSED, struct FTW *ftwbuf UNUSED)
 {
   if (lchown(fpath, chown_uid, chown_gid) < 0)
     die("Cannot chown %s: %m", fpath);
@@ -653,14 +654,14 @@ static const struct cg_controller_desc cg_controllers[CG_NUM_CONTROLLERS+1] = {
 
 #define FOREACH_CG_CONTROLLER(_controller) \
   for (cg_controller (_controller) = 0; \
-      (_controller) < CG_NUM_CONTROLLERS; (_controller)++)
+       (_controller) < CG_NUM_CONTROLLERS; (_controller)++)
 
 static const char *cg_controller_name(cg_controller c)
 {
   return cg_controllers[c].name;
 }
 
-static const int cg_controller_optional(cg_controller c)
+static int cg_controller_optional(cg_controller c)
 {
   return cg_controllers[c].optional;
 }
@@ -679,6 +680,7 @@ cg_makepath(char *buf, size_t len, cg_controller c, const char *attr)
 static int
 cg_read(cg_controller controller, const char *attr, char *buf)
 {
+  int result = 0;
   int maybe = 0;
   if (attr[0] == '?')
     {
@@ -693,7 +695,7 @@ cg_read(cg_controller controller, const char *attr, char *buf)
   if (fd < 0)
     {
       if (maybe)
-	return 0;
+	goto fail;
       die("Cannot read %s: %m", path);
     }
 
@@ -701,7 +703,7 @@ cg_read(cg_controller controller, const char *attr, char *buf)
   if (n < 0)
     {
       if (maybe)
-	return 0;
+	goto fail_close;
       die("Cannot read %s: %m", path);
     }
   if (n >= CG_BUFSIZE - 1)
@@ -713,8 +715,11 @@ cg_read(cg_controller controller, const char *attr, char *buf)
   if (verbose > 1)
     msg("CG: Read %s = %s\n", attr, buf);
 
+  result = 1;
+fail_close:
   close(fd);
-  return 1;
+fail:
+  return result;
 }
 
 static void __attribute__((format(printf,3,4)))
@@ -745,7 +750,7 @@ cg_write(cg_controller controller, const char *attr, const char *fmt, ...)
   if (fd < 0)
     {
       if (maybe)
-	return;
+	goto fail;
       else
 	die("Cannot write %s: %m", path);
     }
@@ -754,14 +759,16 @@ cg_write(cg_controller controller, const char *attr, const char *fmt, ...)
   if (written < 0)
     {
       if (maybe)
-	return;
+	goto fail_close;
       else
 	die("Cannot set %s to %s: %m", path, buf);
     }
   if (written != n)
     die("Short write to %s (%d out of %d bytes)", path, written, n);
 
+fail_close:
   close(fd);
+fail:
   va_end(args);
 }
 
@@ -880,10 +887,12 @@ cg_remove(void)
 
   FOREACH_CG_CONTROLLER(controller)
     {
-      if (cg_controller_optional(controller)) {
-	if (!cg_read(controller, "?tasks", buf))
-	  continue;
-      } else
+      if (cg_controller_optional(controller))
+	{
+	  if (!cg_read(controller, "?tasks", buf))
+	    continue;
+	}
+      else
 	cg_read(controller, "tasks", buf);
 
       if (buf[0])
@@ -989,12 +998,16 @@ signal_alarm(int unused UNUSED)
 }
 
 static void
-signal_int(int unused UNUSED)
+signal_int(int signum)
 {
   /* Interrupts are fatal, so no synchronization requirements. */
-  //meta_printf("exitsig:%d\n", SIGINT);
-  //err("SG: Interrupted");
-  sigint_plemplem = 1;
+  if (signum != SIGINT)
+    {
+      meta_printf("exitsig:%d\n", signum);
+      err("SG: Interrupted");
+    }
+  else
+     sigint_plemplem = 1;
 }
 
 #define PROC_BUF_SIZE 4096
@@ -1092,7 +1105,17 @@ box_keeper(void)
   struct sigaction sa;
   bzero(&sa, sizeof(sa));
   sa.sa_handler = signal_int;
+  sigaction(SIGHUP, &sa, NULL);
   sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGQUIT, &sa, NULL);
+  sigaction(SIGILL, &sa, NULL);
+  sigaction(SIGABRT, &sa, NULL);
+  sigaction(SIGFPE, &sa, NULL);
+  sigaction(SIGSEGV, &sa, NULL);
+  sigaction(SIGPIPE, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+  sigaction(SIGUSR1, &sa, NULL);
+  sigaction(SIGUSR2, &sa, NULL);
 
   gettimeofday(&start_time, NULL);
   ticks_per_sec = sysconf(_SC_CLK_TCK);
@@ -1352,7 +1375,7 @@ run(char **argv)
   box_pid = clone(
     box_inside,			// Function to execute as the body of the new process
     argv,			// Pass our stack
-    SIGCHLD | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWNS | CLONE_NEWPID,
+    SIGCHLD | CLONE_NEWIPC | (share_net ? 0 : CLONE_NEWNET) | CLONE_NEWNS | CLONE_NEWPID,
     argv);			// Pass the arguments
   if (box_pid < 0)
     die("clone: %m");
@@ -1364,8 +1387,9 @@ run(char **argv)
 static void
 show_version(void)
 {
-  printf("Process isolator 1.0\n");
-  printf("(c) 2012 Martin Mares and Bernard Blackham\n");
+  printf("The process isolator " VERSION "\n");
+  printf("(c) 2012--" YEAR " Martin Mares and Bernard Blackham\n");
+  printf("Built on " BUILD_DATE " from Git commit " BUILD_COMMIT "\n");
   printf("\nCompile-time configuration:\n");
   printf("Sandbox directory: %s\n", CONFIG_ISOLATE_BOX_DIR);
   printf("Sandbox credentials: uid=%u-%u gid=%u-%u\n",
@@ -1414,6 +1438,7 @@ Options:\n\
 -m, --mem=<size>\tLimit address space to <size> KB\n\
 -M, --meta=<file>\tOutput process information to <file> (name:value)\n\
 -q, --quota=<blk>,<ino>\tSet disk quota to <blk> blocks and <ino> inodes\n\
+    --share-net\t\tShare network namespace with the parent process\n\
 -k, --stack=<size>\tLimit stack size to <size> KB (default: 0=unlimited)\n\
 -r, --stderr=<file>\tRedirect stderr to <file>\n\
 -i, --stdin=<file>\tRedirect stdin from <file>\n\
@@ -1440,6 +1465,7 @@ enum opt_code {
   OPT_CG,
   OPT_CG_MEM,
   OPT_CG_TIMING,
+  OPT_SHARE_NET,
 };
 
 static const char short_opts[] = "b:c:d:eE:i:k:m:M:o:p::q:r:t:vw:x:";
@@ -1452,7 +1478,7 @@ static const struct option long_opts[] = {
   { "cg-timing",	0, NULL, OPT_CG_TIMING },
   { "cleanup",		0, NULL, OPT_CLEANUP },
   { "dir",		1, NULL, 'd' },
-  { "fsize",           1, NULL, 'f' },
+  { "fsize",		1, NULL, 'f' },
   { "env",		1, NULL, 'E' },
   { "extra-time",	1, NULL, 'x' },
   { "full-env",		0, NULL, 'e' },
@@ -1462,6 +1488,7 @@ static const struct option long_opts[] = {
   { "processes",	2, NULL, 'p' },
   { "quota",		1, NULL, 'q' },
   { "run",		0, NULL, OPT_RUN },
+  { "share-net",	0, NULL, OPT_SHARE_NET },
   { "stack",		1, NULL, 'k' },
   { "stderr",		1, NULL, 'r' },
   { "stdin",		1, NULL, 'i' },
@@ -1555,7 +1582,7 @@ main(int argc, char **argv)
       case OPT_RUN:
       case OPT_CLEANUP:
       case OPT_VERSION:
-	if (!mode || mode == c)
+	if (!mode || (int) mode == c)
 	  mode = c;
 	else
 	  usage("Only one command is allowed.\n");
@@ -1565,6 +1592,9 @@ main(int argc, char **argv)
 	break;
       case OPT_CG_TIMING:
 	cg_timing = 1;
+	break;
+      case OPT_SHARE_NET:
+	share_net = 1;
 	break;
       default:
 	usage(NULL);
