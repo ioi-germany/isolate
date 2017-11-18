@@ -23,7 +23,7 @@ by contestants in a controlled environment.
 The sandbox is used in the following way:
 
 * Run *isolate --init*, which initializes the sandbox, creates its working directory and
-prints its name to the standard output.
+prints its name to the standard output. Fails if the sandbox already existed.
 
 * Populate the directory with the executable file of the program and its
 input files.
@@ -33,7 +33,8 @@ status of the program is written to the standard error stream.
 
 * Fetch the output of the program from the directory.
 
-* Run *isolate --cleanup* to remove temporary files.
+* Run *isolate --cleanup* to remove temporary files. Does nothing if the sandbox
+was already cleaned up.
 
 Please note that by default, the program is not allowed to start multiple
 processes of threads. If you need that, turn on the control group mode
@@ -84,19 +85,24 @@ OPTIONS
 
 *-q, --quota=*'blocks'*,*'inodes'::
 	Set disk quota to a given number of blocks and inodes. This requires the
-	filesystem to be mounted with support for quotas.
+	filesystem to be mounted with support for quotas. Please note that this
+	currently works only on the ext family of filesystems (other filesystems
+	use other interfaces for setting quotas).
 
 *-i, --stdin=*'file'::
 	Redirect standard input from 'file'. The 'file' has to be accessible
-	inside the sandbox.
+	inside the sandbox. Otherwise, standard input is inherited from the
+	parent process.
 
 *-o, --stdout=*'file'::
 	Redirect standard output to 'file'. The 'file' has to be accessible
-	inside the sandbox.
+	inside the sandbox. Otherwise, standard output is inherited from the
+	parent process and the sandbox manager does not write anything to it.
 
 *-r, --stderr=*'file'::
 	Redirect standard error output to 'file'. The 'file' has to be accessible
-	inside the sandbox.
+	inside the sandbox. Otherwise, standard error output is redirected to stdout
+	(either inherited from parent process or redirected to file via previous option).
 
 *-c, --chdir=*'dir'::
 	Change directory to 'dir' before executing the program. This path must be
@@ -115,9 +121,22 @@ OPTIONS
 	to permit communication, you can use this switch to keep the child process
 	in parent's network namespace.
 
+*--inherit-fds*::
+	By default, isolate closes all file descriptors passed from its parent.
+	This prevents unintentional descriptor leaks. In some cases, passing extra
+	descriptors to the sandbox can be desirable, so you can use this switch
+	to make them survive. However, descriptors 0, 1, and 2 are always handled
+	specially and redirected either to the file specified by *--stdin* and friends,
+	or to /dev/null.
+
 *-v, --verbose*::
 	Tell the sandbox manager to be verbose and report on what is going on.
 	Using *-v* multiple times produces even more jabber.
+
+*-s, --silent*::
+	Tell the sandbox manager to keep silence. No status messages are printed
+	to stderr except for fatal errors of the sandbox itself. The combination of
+	*--verbose* and *--silent* has an undefined effect.
 
 ENVIRONMENT RULES
 -----------------
@@ -147,11 +166,11 @@ requested by directory rules:
 
 *-d, --dir=*'in'*=*'out'[*:*'options']::
 	Bind the directory 'out' as seen by the caller to the path 'in' inside the sandbox.
-	If there already was a directory rule for 'out', it is replaced.
+	If there already was a directory rule for 'in', it is replaced.
 
 *-d, --dir=*'dir'[*:*'options']::
 	Bind the directory +/+'dir' to 'dir' inside the sandbox.
-	If there already was a directory rule for 'out', it is replaced.
+	If there already was a directory rule for 'in', it is replaced.
 
 *-d, --dir=*'in'*=*::
 	Remove a directory rule for the path 'in' inside the sandbox.
@@ -183,7 +202,7 @@ CONTROL GROUPS
 --------------
 Isolate can make use of system control groups provided by the kernel
 to constrain programs consisting of multiple processes. Please note
-that this feature needs special system setup described in the REQUIREMENTS
+that this feature needs special system setup described in the INSTALLATION
 section.
 
 *--cg*::
@@ -236,6 +255,9 @@ of format 'key'*:*'value'. The following keys are defined:
 *time-wall*::
 	Wall clock time of the program in fractional seconds.
 
+Please note that not all keys have to be present.
+For example, no *status* nor *message* is reported upon normal termination.
+
 RETURN VALUE
 ------------
 When the program inside the sandbox finishes correctly, the sandbox returns 0.
@@ -257,14 +279,13 @@ you should also enable the swap controller (+CONFIG_MEMCG_SWAP+).
 
 Debian 7.x and newer require enabling the memory and swap cgroup controllers by
 adding the parameters "cgroup_enable=memory swapaccount=1" to the kernel
-command-line, which can be set using GRUB_CMDLINE_LINUX_DEFAULT in
+command-line, which can be set using +GRUB_CMDLINE_LINUX_DEFAULT+ in
 /etc/default/grub.
 
 Isolate is designed to run setuid to root. The sub-process inside the sandbox
 then switches to a non-privileged user ID (different for each *--box-id*).
-The range of UIDs available and several filesystem paths are embedded in the
-isolate's binary during compilation; please see +config.h+ in the source
-tree for description.
+The range of UIDs available and several filesystem paths are set in a configuration
+file, by default located in /usr/local/etc/isolate.
 
 Before you run isolate with control groups, you need to ensure that the cgroup
 filesystem is enabled and mounted.  Most modern Linux distributions already
@@ -275,7 +296,8 @@ REPRODUCIBILITY
 ---------------
 
 The reproducibility of results can be improved by tuning some kernel
-parameters:
+parameters, listed below. Some of these parameters can be checked using the
+program isolate-check-environment.
 
 * Disable address space randomization: +sysctl kernel.randomize_va_space=0+.
 Address space randomization can affect timing, memory usage, and program
@@ -285,8 +307,25 @@ behavior. This setting can be made persistent through /etc/sysctl.d/.
 scaling governor to +performance+. The process for doing this varies between
 distributions.
 
+* Consider disabling Turboboost on CPUs that might support it (most i3/i5/i7
+Intel CPUs). Approach this one with caution. Disabling a CPU that Turboboosts
+from 2.3 GHz to 2.6 GHz would have minimal impact on run-times in exchange
+for determinism, but the same on a CPU that Turboboosts from 1.6 GHz to 2.8
+GHz will incur a much more dramatic slowdown. Perhaps if the ambient
+temperature is controlled and only one single-threaded task is keeping the
+CPU busy at 100%, then TB's behaviour may be reasonably deterministic;
+requires further experimentation to confirm.
+
+* Run evaluations on a single CPU (core). The Linux scheduler has a tendency to randomly
+migrate tasks between CPUs, incurring cache migration costs. You can use isolate's
+configuration file to pin the process to a specified CPU.
+
+* Disable automatic kernel support for transparent huge pages. Both /sys/kernel/mm/transparent_hugepage/enabled
+and /sys/kernel/mm/transparent_hugepage/defrag should be set to "madvise" or "never", and
+/sys/kernel/mm/transparent_hugepage/khugepaged/defrag to 0.
+
 LICENSE
 -------
 Isolate was written by Martin Mares and Bernard Blackham.
 It can be distributed and used under the terms of the GNU
-General Public License version 2.
+General Public License version 2 or any later version.
