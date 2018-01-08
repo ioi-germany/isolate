@@ -543,8 +543,6 @@ setup_fds(void)
       if (open(redir_stderr, O_WRONLY | O_CREAT | O_TRUNC, 0666) != 2)
 	die("open(\"%s\"): %m", redir_stderr);
     }
-  else
-    dup2(1, 2);
 }
 
 static void
@@ -587,9 +585,9 @@ box_inside(void *arg)
   reset_signals();
   cg_enter();
   setup_root();
+  setup_rlimits();
   setup_credentials();
   setup_fds();
-  setup_rlimits();
   char **env = setup_environment();
 
   if (set_cwd && chdir(set_cwd))
