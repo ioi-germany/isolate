@@ -40,13 +40,15 @@ static const struct cg_controller_desc cg_controllers[CG_NUM_CONTROLLERS+1] = {
   for (cg_controller (_controller) = 0; \
        (_controller) < CG_NUM_CONTROLLERS; (_controller)++)
 
-static const char *cg_controller_name(cg_controller c)
+static const char *
+cg_controller_name(cg_controller c)
 {
   assert(c < CG_NUM_CONTROLLERS);
   return cg_controllers[c].name;
 }
 
-static int cg_controller_optional(cg_controller c)
+static int
+cg_controller_optional(cg_controller c)
 {
   assert(c < CG_NUM_CONTROLLERS);
   return cg_controllers[c].optional;
@@ -103,7 +105,7 @@ cg_read(cg_controller controller, const char *attr, char *buf)
   buf[n] = 0;
 
   if (verbose > 1)
-    msg("CG: Read %s = %s\n", attr, buf);
+    msg("CG: Read %s = <%s>\n", attr, buf);
 
   result = 1;
 fail_close:
@@ -278,6 +280,24 @@ cg_stats(void)
     }
   if (mem)
     meta_printf("cg-mem:%lld\n", mem >> 10);
+
+  // OOM kill detection
+  if (cg_read(CG_MEMORY, "?memory.oom_control", buf))
+    {
+      int oom_killed = 0;
+      char *s = buf;
+      while (s)
+	{
+	  if (sscanf(s, "oom_kill %d", &oom_killed) == 1 && oom_killed)
+	    {
+	      meta_printf("cg-oom-killed:1\n");
+	      break;
+	    }
+	  s = strchr(s, '\n');
+	  if (s)
+	    s++;
+	}
+    }
 }
 
 void
@@ -290,13 +310,9 @@ cg_remove(void)
 
   FOREACH_CG_CONTROLLER(controller)
     {
-      if (cg_controller_optional(controller))
-	{
-	  if (!cg_read(controller, "?tasks", buf))
-	    continue;
-	}
-      else
-	cg_read(controller, "tasks", buf);
+      // The cgroup can be non-existent at this moment (e.g., --cleanup before the first --init)
+      if (!cg_read(controller, "?tasks", buf))
+	continue;
 
       if (buf[0])
 	die("Some tasks left in controller %s of cgroup %s, failed to remove it",

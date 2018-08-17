@@ -1,7 +1,7 @@
 /*
  *	Process Isolator -- Rules
  *
- *	(c) 2012-2017 Martin Mares <mj@ucw.cz>
+ *	(c) 2012-2018 Martin Mares <mj@ucw.cz>
  *	(c) 2012-2014 Bernard Blackham <bernard@blackham.com.au>
  */
 
@@ -169,6 +169,8 @@ enum dir_rule_flags {
   DIR_FLAG_FS = 4,
   DIR_FLAG_MAYBE = 8,
   DIR_FLAG_DEV = 16,
+  DIR_FLAG_DEFAULT = 1U << 15,	// Used internally
+  DIR_FLAG_DISABLED = 1U << 16,	// Used internally
 };
 
 static const char * const dir_flag_names[] = { "rw", "noexec", "fs", "maybe", "dev" };
@@ -176,12 +178,39 @@ static const char * const dir_flag_names[] = { "rw", "noexec", "fs", "maybe", "d
 static struct dir_rule *first_dir_rule;
 static struct dir_rule **last_dir_rule = &first_dir_rule;
 
-static int add_dir_rule(char *in, char *out, unsigned int flags)
+static char *
+sanitize_dir_path(char *path)
 {
-  // Make sure that "in" is relative
-  while (in[0] == '/')
-    in++;
-  if (!*in)
+  // Strip leading slashes
+  while (*path == '/')
+    path++;
+  if (!*path)
+    return NULL;
+
+  // Check for ".." components
+  char *p = path;
+  while (*p)
+    {
+      char *next = strchr(p, '/');
+      if (!next)
+	next = p + strlen(p);
+
+      int len = next - p;
+      if (len == 2 && !memcmp(p, "..", 2))
+	return NULL;
+
+      p = *next ? next+1 : next;
+    }
+
+  return path;
+}
+
+static int
+add_dir_rule(char *in, char *out, unsigned int flags)
+{
+  // Make sure that "in" does not try to escape the box
+  in = sanitize_dir_path(in);
+  if (!in)
     return 0;
 
   // Check "out"
@@ -216,7 +245,8 @@ static int add_dir_rule(char *in, char *out, unsigned int flags)
   return 1;
 }
 
-static unsigned int parse_dir_option(char *opt)
+static unsigned int
+parse_dir_option(char *opt)
 {
   for (unsigned int i = 0; i < ARRAY_SIZE(dir_flag_names); i++)
     if (!strcmp(opt, dir_flag_names[i]))
@@ -224,12 +254,13 @@ static unsigned int parse_dir_option(char *opt)
   die("Unknown directory option %s", opt);
 }
 
-int set_dir_action(char *arg)
+static int
+set_dir_action_ext(char *arg, unsigned int ext_flags)
 {
   arg = xstrdup(arg);
 
   char *colon = strchr(arg, ':');
-  unsigned int flags = 0;
+  unsigned int flags = ext_flags;
   while (colon)
     {
       *colon++ = 0;
@@ -254,15 +285,28 @@ int set_dir_action(char *arg)
     }
 }
 
-void init_dir_rules(void)
+int
+set_dir_action(char *arg)
 {
-  set_dir_action("box=./box:rw");
-  set_dir_action("bin");
-  set_dir_action("dev:dev");
-  set_dir_action("lib");
-  set_dir_action("lib64:maybe");
-  set_dir_action("proc=proc:fs");
-  set_dir_action("usr");
+  return set_dir_action_ext(arg, 0);
+}
+
+static int
+set_dir_action_default(char *arg)
+{
+  return set_dir_action_ext(arg, DIR_FLAG_DEFAULT);
+}
+
+void
+init_dir_rules(void)
+{
+  set_dir_action_default("box=./box:rw");
+  set_dir_action_default("bin");
+  set_dir_action_default("dev:dev");
+  set_dir_action_default("lib");
+  set_dir_action_default("lib64:maybe");
+  set_dir_action_default("proc=proc:fs");
+  set_dir_action_default("usr");
 }
 
 static void
@@ -283,27 +327,51 @@ set_cap_sys_admin(void)
 }
 
 void
-apply_dir_rules(void)
+apply_dir_rules(int with_defaults)
 {
+  /*
+   * Before mounting anything, we create all mount points inside the box.
+   * This is necessary to avoid bypassing directory permissions. If you
+   * want nested binds, you have to create the mount points explicitly.
+   */
   for (struct dir_rule *r = first_dir_rule; r; r=r->next)
     {
+      if (!with_defaults && (r->flags & DIR_FLAG_DEFAULT))
+        continue;
+
       char *in = r->inside;
       char *out = r->outside;
+
       if (!out)
 	{
-	  msg("Not binding anything on %s\n", r->inside);
+	  msg("Not binding anything on %s\n", in);
+	  r->flags |= DIR_FLAG_DISABLED;
 	  continue;
 	}
 
       if ((r->flags & DIR_FLAG_MAYBE) && !dir_exists(out))
 	{
 	  msg("Not binding %s on %s (does not exist)\n", out, r->inside);
+	  r->flags |= DIR_FLAG_DISABLED;
 	  continue;
 	}
 
       char root_in[1024];
       snprintf(root_in, sizeof(root_in), "root/%s", in);
       make_dir(root_in);
+    }
+
+  for (struct dir_rule *r = first_dir_rule; r; r=r->next)
+    {
+      if (r->flags & DIR_FLAG_DISABLED)
+	continue;
+      if (!with_defaults && (r->flags & DIR_FLAG_DEFAULT))
+        continue;
+
+      char *in = r->inside;
+      char *out = r->outside;
+      char root_in[1024];
+      snprintf(root_in, sizeof(root_in), "root/%s", in);
 
       unsigned long mount_flags = 0;
       if (!(r->flags & DIR_FLAG_RW))
@@ -318,6 +386,13 @@ apply_dir_rules(void)
 	  msg("Mounting %s on %s (flags %lx)\n", out, in, mount_flags);
 	  if (mount("none", root_in, out, mount_flags, "") < 0)
 	    die("Cannot mount %s on %s: %m", out, in);
+	  if (!strcmp(in, "proc"))
+	    {
+	      // If we are mounting procfs, add hidepid=2, so that only the processes
+	      // of the same user are visible. This has to be done as a remount.
+	      if (mount("none", root_in, out, MS_REMOUNT | mount_flags, "hidepid=2") < 0)
+		die("Cannot re-mount proc with hidepid option: %m");
+	    }
 	}
       else
 	{
